@@ -278,6 +278,26 @@ class WhatsAppAdapter(BasePlatformAdapter):
         # notification before the normal "✓ whatsapp disconnected" fires.
         self._shutting_down: bool = False
 
+        # READ_ONLY_INTAKE Layer C — early-return guard for every outbound
+        # method + persistence shunt in _poll_messages. Read once from env
+        # at construction so subsequent edits to os.environ don't change
+        # behavior mid-process (security-relevant: prevents an attacker who
+        # later mutates env from un-disabling sends without a restart).
+        self._read_only_intake: bool = str(
+            os.environ.get("WHATSAPP_READ_ONLY_INTAKE", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._intake_store = None  # Lazily constructed in connect() to avoid
+                                   # SQLite open at adapter-init time (some
+                                   # tests instantiate the adapter cheaply).
+        if getattr(self, "_read_only_intake", False):
+            logger.warning(
+                "[%s] WhatsApp adapter starting in READ_ONLY_INTAKE mode — "
+                "send/edit/media/typing disabled at Layer C; handle_message() "
+                "suppressed; events will be persisted to "
+                "~/.hermes/whatsapp/intake.db (see whatsapp_intake_store.py).",
+                self.name,
+            )
+
     def _effective_reply_prefix(self) -> str:
         """Return the prefix the Node bridge will add in self-chat mode."""
         whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
@@ -641,9 +661,25 @@ class WhatsAppAdapter(BasePlatformAdapter):
             # Create a persistent HTTP session for all bridge communication
             self._http_session = aiohttp.ClientSession()
 
+            # Lazy-init the READ_ONLY_INTAKE staging store. We do it here (not
+            # in __init__) so SQLite open + WAL setup only run when the adapter
+            # actually starts. Test harnesses that instantiate the adapter
+            # without calling connect() do not touch the filesystem.
+            if getattr(self, "_read_only_intake", False) and getattr(self, "_intake_store", None) is None:
+                from gateway.platforms.whatsapp_intake_store import WhatsAppIntakeStore
+                self._intake_store = WhatsAppIntakeStore()
+                logger.info(
+                    "[%s] READ_ONLY_INTAKE staging store ready at %s "
+                    "(per_chat_limit=%d, retention_days=%d, body_max=%d)",
+                    self.name, self._intake_store.path,
+                    self._intake_store.per_chat_limit,
+                    self._intake_store.retention_days,
+                    self._intake_store.body_max,
+                )
+
             # Start message polling task
             self._poll_task = asyncio.create_task(self._poll_messages())
-            
+
             self._mark_connected()
             print(f"[{self.name}] Bridge started on port {self._bridge_port}")
             return True
@@ -818,6 +854,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         Formats markdown for WhatsApp, splits long messages into chunks
         that preserve code block boundaries, and sends each chunk sequentially.
         """
+        if getattr(self, "_read_only_intake", False):
+            return SendResult(success=False, error="disabled_by_policy:read_only_intake")
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -876,6 +914,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
+        if getattr(self, "_read_only_intake", False):
+            return SendResult(success=False, error="disabled_by_policy:read_only_intake")
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -909,6 +949,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
+        if getattr(self, "_read_only_intake", False):
+            return SendResult(success=False, error="disabled_by_policy:read_only_intake")
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -957,6 +999,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
     ) -> SendResult:
         """Download image URL to cache, send natively via bridge."""
+        if getattr(self, "_read_only_intake", False):
+            return SendResult(success=False, error="disabled_by_policy:read_only_intake")
         try:
             local_path = await cache_image_from_url(image_url)
             return await self._send_media_to_bridge(chat_id, local_path, "image", caption)
@@ -972,6 +1016,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a local image file natively via bridge."""
+        if getattr(self, "_read_only_intake", False):
+            return SendResult(success=False, error="disabled_by_policy:read_only_intake")
         return await self._send_media_to_bridge(chat_id, image_path, "image", caption)
 
     async def send_video(
@@ -983,6 +1029,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a video natively via bridge — plays inline in WhatsApp."""
+        if getattr(self, "_read_only_intake", False):
+            return SendResult(success=False, error="disabled_by_policy:read_only_intake")
         return await self._send_media_to_bridge(chat_id, video_path, "video", caption)
 
     async def send_voice(
@@ -994,6 +1042,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send an audio file as a WhatsApp voice message via bridge."""
+        if getattr(self, "_read_only_intake", False):
+            return SendResult(success=False, error="disabled_by_policy:read_only_intake")
         return await self._send_media_to_bridge(chat_id, audio_path, "audio", caption)
 
     async def send_document(
@@ -1006,6 +1056,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a document/file as a downloadable attachment via bridge."""
+        if getattr(self, "_read_only_intake", False):
+            return SendResult(success=False, error="disabled_by_policy:read_only_intake")
         return await self._send_media_to_bridge(
             chat_id, file_path, "document", caption,
             file_name or os.path.basename(file_path),
@@ -1013,6 +1065,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
+        if getattr(self, "_read_only_intake", False):
+            return
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
@@ -1079,8 +1133,24 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         messages = await resp.json()
                         for msg_data in messages:
                             event = await self._build_message_event(msg_data)
-                            if event:
-                                await self.handle_message(event)
+                            if not event:
+                                continue
+                            if getattr(self, "_read_only_intake", False):
+                                # Layer C inbound shunt: persist to local SQLite
+                                # staging and DO NOT invoke handle_message().
+                                # Suppresses the agent loop, LLM extraction,
+                                # auto-reply, and any downstream side effects.
+                                if self._intake_store is not None:
+                                    try:
+                                        await self._intake_store.persist(event, msg_data)
+                                    except Exception:  # pragma: no cover
+                                        logger.exception(
+                                            "[%s] intake_store.persist failed; "
+                                            "message dropped (READ_ONLY_INTAKE)",
+                                            self.name,
+                                        )
+                                continue
+                            await self.handle_message(event)
             except asyncio.CancelledError:
                 break
             except Exception as e:

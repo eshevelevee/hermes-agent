@@ -21,6 +21,63 @@ with third-party bridges. When this happens, Hermes will update the bridge depen
 bot stops working after a WhatsApp update, pull the latest Hermes version and re-pair.
 :::
 
+## READ_ONLY_INTAKE Mode (security-hardened pilot)
+
+For deployments where you want WhatsApp **passive ingest only** — no auto-reply, no agent loop, no outbound messages of any kind — set:
+
+```bash
+WHATSAPP_READ_ONLY_INTAKE=true
+```
+
+When this flag is `true`, three independent layers block every outbound WhatsApp operation:
+
+| Layer | What it stops |
+|---|---|
+| **HTTP middleware** | `POST /send`, `POST /edit`, `POST /send-media`, `POST /typing` return `403 disabled_by_policy`. `GET /health`, `GET /messages`, `GET /chat/:id` remain available. |
+| **Baileys socket wrap** | `sock.sendMessage`, `sendPresenceUpdate`, `sendReceipt`, `readMessages`, `sendReaction`, `updateMediaMessage`, group/profile mutations — all throw `WA_READ_ONLY_INTAKE` if called from inside the bridge. |
+| **Python adapter** | Every `send_*` / `edit_message` / `send_typing` on `WhatsAppAdapter` early-returns `SendResult(success=False, error="disabled_by_policy:read_only_intake")` before any HTTP call. |
+
+Incoming messages still flow through `messages.upsert` and are **persisted to a Hermes-local SQLite staging DB** at `~/.hermes/whatsapp/intake.db`. The Hermes agent loop (`handle_message()`) is **suppressed** — no LLM is invoked, no reply is generated, no downstream platform fires. Inspect what was captured with:
+
+```bash
+sqlite3 ~/.hermes/whatsapp/intake.db \
+  "SELECT id, chat_id, sender_name, body, ingested_at FROM whatsapp_ingest_messages ORDER BY id DESC LIMIT 20;"
+```
+
+### Bounded history
+
+| Policy | Default | Env var |
+|---|---|---|
+| Per-chat row retention | 500 messages | `WHATSAPP_INTAKE_PER_CHAT_LIMIT` |
+| Global age retention | 30 days | `WHATSAPP_INTAKE_RETENTION_DAYS` |
+| Body length cap | 4096 chars (truncated with `…[truncated]` marker) | `WHATSAPP_INTAKE_BODY_MAX` |
+| Media file retention (cache dirs) | 7 days | `WHATSAPP_INTAKE_MEDIA_RETENTION_DAYS` |
+
+Media bytes are **never** stored in the DB — only the path, mime, size, and SHA-256. Voice notes and documents are captured as metadata only; no Whisper / OCR / LLM extraction runs automatically.
+
+### Kill switch
+
+`tools/wa_intake_kill_switch.sh` stops the bridge, wipes the session keys, clears media caches, and quarantines the intake DB (renames with timestamp; does not delete the audit trail). **Manual step required:** open WhatsApp on your iPhone → Settings → Linked Devices → "Hermes Agent" → Log Out. Local cleanup does not revoke the linked-device session on WhatsApp's side.
+
+```bash
+bash tools/wa_intake_kill_switch.sh
+```
+
+### When to use
+
+- SD-grade WhatsApp intake where the connector must not have any outbound side effect against a personal account
+- Compliance-driven setups that need an auditable "we only ever read" guarantee
+- Pilots / forensics where the agent loop is intentionally off
+
+### When NOT to use
+
+- Production bot deployments — leave `WHATSAPP_READ_ONLY_INTAKE` unset / `false` and the adapter behaves normally
+- Tests that exercise outbound flows — use a mock adapter, not this mode
+
+See `environments/wa-intake/.env.example` for a complete sample env.
+
+---
+
 ## Two Modes
 
 | Mode | How it works | Best for |

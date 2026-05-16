@@ -288,6 +288,11 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `WHATSAPP_ALLOWED_USERS` | Comma-separated phone numbers (with country code, no `+`), or `*` to allow all senders |
 | `WHATSAPP_ALLOW_ALL_USERS` | Allow all WhatsApp senders without an allowlist (`true`/`false`) |
 | `WHATSAPP_DEBUG` | Log raw message events in the bridge for troubleshooting (`true`/`false`) |
+| `WHATSAPP_READ_ONLY_INTAKE` | Master switch for READ_ONLY_INTAKE mode — disables all outbound WhatsApp operations and persists inbound to `~/.hermes/whatsapp/intake.db` (`true`/`false`, default `false`) |
+| `WHATSAPP_INTAKE_PER_CHAT_LIMIT` | Per-chat row retention for the intake store, in rows (default `500`) |
+| `WHATSAPP_INTAKE_RETENTION_DAYS` | Global row age retention for the intake store, in days (default `30`) |
+| `WHATSAPP_INTAKE_BODY_MAX` | Maximum stored body length per message, in characters; longer bodies are truncated with `…[truncated]` marker (default `4096`) |
+| `WHATSAPP_INTAKE_MEDIA_RETENTION_DAYS` | Media cache retention in days; files in `~/.hermes/{image,document,audio}_cache` older than this are deleted by the sweep (default `7`) |
 | `SIGNAL_HTTP_URL` | signal-cli daemon HTTP endpoint (for example `http://127.0.0.1:8080`) |
 | `SIGNAL_ACCOUNT` | Bot phone number in E.164 format |
 | `SIGNAL_ALLOWED_USERS` | Comma-separated E.164 phone numbers or UUIDs |

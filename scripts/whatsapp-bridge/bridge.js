@@ -58,6 +58,72 @@ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
 
+// READ_ONLY_INTAKE master switch — when true, ALL outbound WhatsApp
+// operations are physically disabled at three layers:
+//   Layer A: HTTP middleware below blocks POST /send|/edit|/send-media|/typing
+//   Layer B: monkey-patched sock outbound methods throw WA_READ_ONLY_INTAKE
+//   Layer C: Python adapter early-returns disabled_by_policy (gateway/platforms/whatsapp.py)
+const READ_ONLY_INTAKE = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.WHATSAPP_READ_ONLY_INTAKE || '').toLowerCase()
+);
+
+// HTTP routes blocked by Layer A under READ_ONLY_INTAKE. Match by exact path.
+const OUTBOUND_ROUTES = new Set(['/send', '/edit', '/send-media', '/typing']);
+
+// Baileys socket methods wrapped by Layer B under READ_ONLY_INTAKE. The list
+// covers every outbound verb Baileys exposes today plus protocol-level write
+// helpers; if Baileys upstream adds a new outbound method, the static scanner
+// in scripts/whatsapp-bridge/read_only.test.mjs will flag the unguarded
+// callsite on the next CI run.
+const READ_ONLY_BAILEYS_BLOCKED_METHODS = [
+  'sendMessage',
+  'sendPresenceUpdate',
+  'sendReceipt',
+  'readMessages',
+  'sendReaction',
+  'chatModify',
+  'sendChatModification',
+  'profilePictureUrl',
+  'updateBlockStatus',
+  'updateProfilePicture',
+  'updateProfileName',
+  'updateProfileStatus',
+  'groupCreate',
+  'groupLeave',
+  'groupUpdateSubject',
+  'groupParticipantsUpdate',
+  'groupInviteCode',
+  'updateMediaMessage',
+];
+
+function readOnlyDeny(methodName) {
+  return async (...args) => {
+    const err = new Error(
+      `disabled_by_policy: sock.${methodName}() blocked under READ_ONLY_INTAKE`
+    );
+    err.code = 'WA_READ_ONLY_INTAKE';
+    let argPreview = '';
+    try { argPreview = JSON.stringify(args[0] ?? null).slice(0, 200); } catch {}
+    console.error(`[bridge] BLOCKED sock.${methodName}() — ${argPreview}`);
+    throw err;
+  };
+}
+
+// Return safe options for downloadMediaMessage. Under READ_ONLY_INTAKE we
+// pass reuploadRequest: undefined so that a media-decrypt failure cannot
+// trigger an outbound re-upload-request stanza to the sender (Baileys'
+// sock.updateMediaMessage). Outside read-only mode we keep the existing
+// behavior so production senders can recover lost media.
+function safeDownloadOptions(sockInstance) {
+  if (READ_ONLY_INTAKE) {
+    return { logger, reuploadRequest: undefined };
+  }
+  return { logger, reuploadRequest: sockInstance.updateMediaMessage };
+}
+
+// Counter exposed via /health for runtime telemetry of L1/L2 blocks.
+let blockedOutboundCount = 0;
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -180,6 +246,23 @@ async function startSocket() {
       return { conversation: '' };
     },
   });
+
+  // Layer B — Baileys socket outbound wrap. Replace every outbound verb on
+  // the live socket instance with a function that throws WA_READ_ONLY_INTAKE,
+  // logs the attempt, and increments the telemetry counter. Idempotent: if
+  // Baileys recreates the socket on reconnect (handled in connection.update
+  // 'close' branch by calling startSocket again), this wrap is re-applied.
+  if (READ_ONLY_INTAKE) {
+    for (const m of READ_ONLY_BAILEYS_BLOCKED_METHODS) {
+      if (typeof sock[m] === 'function') {
+        const denyFn = readOnlyDeny(m);
+        sock[m] = async (...args) => {
+          blockedOutboundCount += 1;
+          return denyFn(...args);
+        };
+      }
+    }
+  }
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
@@ -320,7 +403,7 @@ async function startSocket() {
         hasMedia = true;
         mediaType = 'image';
         try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, safeDownloadOptions(sock));
           const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
           const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
           const ext = extMap[mime] || '.jpg';
@@ -336,7 +419,7 @@ async function startSocket() {
         hasMedia = true;
         mediaType = 'video';
         try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, safeDownloadOptions(sock));
           const mime = messageContent.videoMessage.mimetype || 'video/mp4';
           const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
@@ -351,7 +434,7 @@ async function startSocket() {
         mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
         try {
           const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, safeDownloadOptions(sock));
           const mime = audioMsg.mimetype || 'audio/ogg';
           const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
           mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
@@ -367,7 +450,7 @@ async function startSocket() {
         mediaType = 'document';
         const fileName = messageContent.documentMessage.fileName || 'document';
         try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, safeDownloadOptions(sock));
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
           const safeFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
           const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
@@ -461,6 +544,24 @@ app.use((req, res, next) => {
   if (!_ACCEPTED_HOST_VALUES.has(hostOnly)) {
     return res.status(400).json({
       error: 'Invalid Host header. Bridge accepts loopback hosts only.',
+    });
+  }
+  next();
+});
+
+// Layer A — block outbound HTTP routes under READ_ONLY_INTAKE before any
+// route handler runs. Allowed inbound/metadata routes: GET /health,
+// GET /messages, GET /chat/:id. Blocked outbound routes are listed in
+// OUTBOUND_ROUTES. Express normalizes req.path to the route path (query
+// params stripped), so exact-match is safe.
+app.use((req, res, next) => {
+  if (READ_ONLY_INTAKE && OUTBOUND_ROUTES.has(req.path)) {
+    blockedOutboundCount += 1;
+    console.error(`[bridge] BLOCKED ${req.method} ${req.path} — READ_ONLY_INTAKE active`);
+    return res.status(403).json({
+      error: 'disabled_by_policy',
+      mode: 'read_only_intake',
+      route: req.path,
     });
   }
   next();
@@ -683,6 +784,8 @@ app.get('/health', (req, res) => {
     status: connectionState,
     queueLength: messageQueue.length,
     uptime: process.uptime(),
+    readOnlyIntake: READ_ONLY_INTAKE,
+    blockedOutboundCount,
   });
 });
 
@@ -697,6 +800,7 @@ if (PAIR_ONLY) {
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
+    console.log(`🔒 READ_ONLY_INTAKE=${READ_ONLY_INTAKE} (outbound routes ${READ_ONLY_INTAKE ? 'BLOCKED' : 'allowed'}; sock outbound methods ${READ_ONLY_INTAKE ? 'WRAPPED' : 'pass-through'})`);
     if (ALLOWED_USERS.size > 0) {
       console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
     } else if (WHATSAPP_MODE === 'self-chat') {
