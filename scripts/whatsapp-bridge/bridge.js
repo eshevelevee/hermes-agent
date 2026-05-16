@@ -23,7 +23,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, chmodSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -75,25 +75,103 @@ const OUTBOUND_ROUTES = new Set(['/send', '/edit', '/send-media', '/typing']);
 // helpers; if Baileys upstream adds a new outbound method, the static scanner
 // in scripts/whatsapp-bridge/read_only.test.mjs will flag the unguarded
 // callsite on the next CI run.
+// Audit-derived comprehensive Layer B block list (Baileys 7.0.0-rc.9).
+// Defense-in-depth wrapper: post-construction sock[m] = readOnlyDeny(m).
+// Note: this CANNOT block closure-captured internal callers — those are
+// neutralized at source level via scripts/apply_hermes_patches.py
+// modifying @whiskeysockets/baileys/lib/Socket/messages-recv.js.
+//
+// Deliberately NOT wrapped:
+//   - sendMessageAck       (protocol-required; without it WA disconnects)
+//   - sendNode             (used by sendMessageAck internally)
+//   - sendRawMessage       (lowest network primitive; needed for keepalive)
+//   - query                (used for fetch* read operations)
+//   - all fetch*/get*      (read operations; harmless under read-only)
 const READ_ONLY_BAILEYS_BLOCKED_METHODS = [
+  // messages-send.js (outbound message + media surface)
   'sendMessage',
-  'sendPresenceUpdate',
   'sendReceipt',
+  'sendReceipts',
   'readMessages',
-  'sendReaction',
+  'relayMessage',
+  'sendPeerDataOperationMessage',
+  'updateMediaMessage',
+  'updateMemberLabel',
+
+  // messages-recv.js (sendMessageAck excluded — protocol-required)
+  'sendRetryRequest',
+  'rejectCall',
+  'fetchMessageHistory',
+  'requestPlaceholderResend',
+
+  // chats.js (presence, profile, privacy, contacts, labels, modifications)
+  'sendPresenceUpdate',
+  'presenceSubscribe',
+  'profilePictureUrl',
+  'updateProfilePicture',
+  'removeProfilePicture',
+  'updateProfileStatus',
+  'updateProfileName',
+  'updateBlockStatus',
+  'updateDisableLinkPreviewsPrivacy',
+  'updateCallPrivacy',
+  'updateMessagesPrivacy',
+  'updateLastSeenPrivacy',
+  'updateOnlinePrivacy',
+  'updateProfilePicturePrivacy',
+  'updateStatusPrivacy',
+  'updateReadReceiptsPrivacy',
+  'updateGroupsAddPrivacy',
+  'updateDefaultDisappearingMode',
   'chatModify',
   'sendChatModification',
-  'profilePictureUrl',
-  'updateBlockStatus',
-  'updateProfilePicture',
-  'updateProfileName',
-  'updateProfileStatus',
+  'cleanDirtyBits',
+  'addOrEditContact',
+  'removeContact',
+  'addLabel',
+  'addChatLabel',
+  'removeChatLabel',
+  'addMessageLabel',
+  'removeMessageLabel',
+  'star',
+  'addOrEditQuickReply',
+  'removeQuickReply',
+  'createCallLink',
+
+  // groups.js (group mutators)
   'groupCreate',
   'groupLeave',
   'groupUpdateSubject',
   'groupParticipantsUpdate',
+  'groupRequestParticipantsUpdate',
+  'groupUpdateDescription',
   'groupInviteCode',
-  'updateMediaMessage',
+  'groupRevokeInvite',
+  'groupAcceptInvite',
+  'groupSettingUpdate',
+  'groupToggleEphemeral',
+
+  // newsletter.js (newsletter mutators)
+  'newsletterCreate',
+  'newsletterUpdate',
+  'newsletterFollow',
+  'newsletterUnfollow',
+  'newsletterMute',
+  'newsletterUnmute',
+  'newsletterUpdateName',
+  'newsletterUpdateDescription',
+  'newsletterUpdatePicture',
+  'newsletterRemovePicture',
+  'newsletterReactMessage',
+  'newsletterDelete',
+
+  // business.js (catalog + business profile mutators)
+  'productCreate',
+  'productDelete',
+  'productUpdate',
+  'updateBussinesProfile',
+  'updateCoverPhoto',
+  'removeCoverPhoto',
 ];
 
 function readOnlyDeny(methodName) {
@@ -197,6 +275,32 @@ function getContextInfo(messageContent) {
 
 mkdirSync(SESSION_DIR, { recursive: true });
 
+// Phase 3 — Session-key permission hardening. Invoked on bridge init AND
+// after every creds.update so newly-written files inherit 0o600 / dirs
+// 0o700. Best-effort: warns on per-entry failures but never throws (we
+// don't want a permission glitch to crash the bridge).
+function hardenSessionPerms(dir) {
+  try {
+    chmodSync(dir, 0o700);
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      try {
+        if (entry.isDirectory()) {
+          hardenSessionPerms(full);
+        } else {
+          chmodSync(full, 0o600);
+        }
+      } catch (e) {
+        console.warn(`[bridge] chmod ${full}: ${e?.message || e}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[bridge] hardenSessionPerms(${dir}): ${e?.message || e}`);
+  }
+}
+
+hardenSessionPerms(SESSION_DIR);
+
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
 function buildLidMap() {
   const map = {};
@@ -253,6 +357,8 @@ async function startSocket() {
   // Baileys recreates the socket on reconnect (handled in connection.update
   // 'close' branch by calling startSocket again), this wrap is re-applied.
   if (READ_ONLY_INTAKE) {
+    let __wrappedCount = 0;
+    const __missingFromBaileys = [];
     for (const m of READ_ONLY_BAILEYS_BLOCKED_METHODS) {
       if (typeof sock[m] === 'function') {
         const denyFn = readOnlyDeny(m);
@@ -260,11 +366,23 @@ async function startSocket() {
           blockedOutboundCount += 1;
           return denyFn(...args);
         };
+        __wrappedCount += 1;
+      } else {
+        __missingFromBaileys.push(m);
       }
     }
+    console.log(`🔒 READ_ONLY: wrapped READ_ONLY_BAILEYS_BLOCKED_METHODS = ${__wrappedCount}/${READ_ONLY_BAILEYS_BLOCKED_METHODS.length} (${__missingFromBaileys.length} not present in this Baileys: ${__missingFromBaileys.join(',') || '-'})`);
   }
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  sock.ev.on('creds.update', async () => {
+    try {
+      await saveCreds();
+      hardenSessionPerms(SESSION_DIR);
+    } catch (e) {
+      console.error('[bridge] creds.update error:', e?.message || e);
+    }
+    lidToPhone = buildLidMap();
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;

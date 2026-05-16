@@ -1253,7 +1253,15 @@ class WhatsAppAdapter(BasePlatformAdapter):
             if data.get("isGroup"):
                 body = self._clean_bot_mention_text(body, data)
             MAX_TEXT_INJECT_BYTES = 100 * 1024
-            if msg_type == MessageType.DOCUMENT and cached_urls:
+            # READ_ONLY_INTAKE contract: documents = metadata only (file path,
+            # size, hash). Skip inline text injection so body stays empty
+            # (or original message body) — intake_store stores doc metadata
+            # via _build_intake_event branch, not via this Hermes-agent path.
+            if (
+                msg_type == MessageType.DOCUMENT
+                and cached_urls
+                and not getattr(self, "_read_only_intake", False)
+            ):
                 for doc_path in cached_urls:
                     ext = Path(doc_path).suffix.lower()
                     if ext in {".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".log", ".py", ".js", ".ts", ".html", ".css"}:

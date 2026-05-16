@@ -551,3 +551,72 @@ def test_ad_16_source_contains_read_only_guard_at_every_outbound_method():
             "the first 1200 chars — Layer C requires every outbound method to "
             "early-return under READ_ONLY_INTAKE."
         )
+
+
+
+# ------------------------------------------------------- RED-fix coverage (Phase 4)
+
+def test_ad_17_doc_text_injection_gated_on_read_only():
+    """Phase 4 / RED finding #4: document text-content injection skipped under READ_ONLY_INTAKE.
+
+    Closes the gap where _build_message_event() inlined text-readable
+    document contents (up to 100KB) into MessageEvent.text, violating
+    the "metadata only" v0 contract for documents.
+
+    Static AST-style scan: assert the DOCUMENT/cached_urls branch is
+    guarded by `not getattr(self, "_read_only_intake", False)`.
+    """
+    import inspect
+    import re
+    from gateway.platforms import whatsapp as adapter_module
+
+    source = inspect.getsource(adapter_module)
+
+    # The full guarded condition (multi-line) must be present
+    # Pattern matches the if-block introduced by Phase 4:
+    #   if (
+    #       msg_type == MessageType.DOCUMENT
+    #       and cached_urls
+    #       and not getattr(self, "_read_only_intake", False)
+    #   ):
+    pattern = re.compile(
+        r"if\s*\(\s*"
+        r"msg_type\s*==\s*MessageType\.DOCUMENT\s*"
+        r"and\s+cached_urls\s*"
+        r"and\s+not\s+getattr\(\s*self\s*,\s*[\"\']_read_only_intake[\"\']\s*,\s*False\s*\)",
+        re.DOTALL,
+    )
+    assert pattern.search(source), (
+        "Phase 4 missing: DOCUMENT/cached_urls text-injection block must be "
+        "guarded by `not getattr(self, '_read_only_intake', False)`. "
+        "Apply /tmp/patch_whatsapp_py_phase4.py (idempotent)."
+    )
+
+    # Defensive: ensure the explicit READ_ONLY contract comment is present.
+    # (Documents that future maintainers might re-enable inadvertently.)
+    assert "READ_ONLY_INTAKE contract: documents = metadata only" in source, (
+        "Phase 4 contract comment missing from whatsapp.py"
+    )
+
+
+def test_ad_18_doc_text_injection_still_works_when_flag_false():
+    """Phase 4 regression: when _read_only_intake=False, the original
+    100KB inline-injection code path is preserved (Hermes agent flow).
+
+    Verified by source scan: the inner `Path(doc_path).read_text(...)`
+    call still exists inside the (now-guarded) DOCUMENT branch.
+    """
+    import inspect
+    from gateway.platforms import whatsapp as adapter_module
+    source = inspect.getsource(adapter_module)
+
+    # The inline-read call must still be reachable inside the guarded branch
+    assert "Path(doc_path).read_text(encoding=\"utf-8\", errors=\"replace\")" in source, (
+        "Regression: text-document inline-read removed entirely; "
+        "Phase 4 must preserve original behavior when flag is False."
+    )
+
+    # And the cap constant must still be in scope before the guarded branch
+    assert "MAX_TEXT_INJECT_BYTES = 100 * 1024" in source, (
+        "Regression: text-inject cap constant removed"
+    )

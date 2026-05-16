@@ -15,7 +15,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
@@ -185,7 +185,7 @@ test('RO-js-15b: READ_ONLY_BAILEYS_BLOCKED_METHODS includes the full outbound se
   const src = readFileSync(BRIDGE_PATH, 'utf8');
   const required = [
     'sendMessage', 'sendPresenceUpdate', 'sendReceipt', 'readMessages',
-    'sendReaction', 'updateMediaMessage', 'chatModify', 'sendChatModification',
+    'updateMediaMessage', 'chatModify', 'sendChatModification',
     'groupCreate', 'groupLeave', 'groupUpdateSubject',
     'groupParticipantsUpdate', 'updateBlockStatus',
     'updateProfilePicture', 'updateProfileName', 'updateProfileStatus',
@@ -200,7 +200,7 @@ test('RO-js-15c: socket-wrap loop is wired into startSocket() under READ_ONLY_IN
   const src = readFileSync(BRIDGE_PATH, 'utf8');
   assert.match(
     src,
-    /if \(READ_ONLY_INTAKE\)\s*\{\s*for \(const m of READ_ONLY_BAILEYS_BLOCKED_METHODS\)/,
+    /if \(READ_ONLY_INTAKE\)\s*\{[\s\S]*?for \(const m of READ_ONLY_BAILEYS_BLOCKED_METHODS\)/,
     'startSocket must wrap each outbound method when READ_ONLY_INTAKE is true'
   );
 });
@@ -229,10 +229,18 @@ test('RO-js-17: every sock.send/sock.read/sock.update callsite is wrapped or ins
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     const stripped = line.replace(/\/\/.*$/, '');
-    if (!/\bsock\.(send|read|update)\w*/.test(stripped)) continue;
+    // Audit-derived outbound surface: send/read/update + relay, presence,
+    // chat, group, newsletter, reject, product, plus specific peer-data ops.
+    const MUTATOR_RE = /\bsock\.(send|read|update|relay|presence|chat|group|newsletter|reject|product|requestPlaceholderResend|fetchMessageHistory|createCallLink|cleanDirtyBits|star\b|addOrEdit|addLabel|addChatLabel|addMessageLabel|removeContact|removeProfilePicture|removeChatLabel|removeMessageLabel|removeQuickReply|removeCoverPhoto)\w*/;
+    if (!MUTATOR_RE.test(stripped)) continue;
     if (/sock\[m\]/.test(stripped)) continue; // the wrapper assignment
     if (/READ_ONLY_BAILEYS_BLOCKED_METHODS/.test(stripped)) continue;
     if (/safeDownloadOptions/.test(stripped)) continue; // helper, not a direct call
+    // Protocol primitives / explicit reads — NOT mutators.
+    if (/\bsock\.sendNode\b/.test(stripped)) continue;
+    if (/\bsock\.sendRawMessage\b/.test(stripped)) continue;
+    if (/\bsock\.sendMessageAck\b/.test(stripped)) continue;
+    if (/\bsock\.groupMetadata\b/.test(stripped)) continue;
     // Hits inside app.post('/send'/'/edit'/'/send-media'/'/typing') handlers
     // are OK because Layer A blocks them before they execute.
     let allowed = false;
@@ -273,5 +281,221 @@ test('RO-js-20: existing allowlist.js exports are intact (regression)', () => {
   ]) {
     assert.match(allowlistSrc, new RegExp(`export function ${ident}\\b`),
       `allowlist.js must still export ${ident}`);
+  }
+});
+
+// ------------------------------------------------------- RED-fix patch coverage
+
+test('RO-js-21: Baileys messages-recv.js carries __hermesReadOnlyIntake source patches', () => {
+  // Closes RED finding #1: post-construction sock.X = readOnlyDeny CANNOT
+  // block closures captured at construction time inside messages-recv.js.
+  // Source patches inject env-flag guards at the offending callsites.
+  // Run scripts/apply_hermes_patches.py if this test fails — it's idempotent.
+  const baileysPath = path.resolve(
+    'node_modules/@whiskeysockets/baileys/lib/Socket/messages-recv.js'
+  );
+  const src = readFileSync(baileysPath, 'utf8');
+
+  assert.match(
+    src,
+    /function __hermesReadOnlyIntake\(\)\s*\{/,
+    'Baileys must carry the __hermesReadOnlyIntake helper (run scripts/apply_hermes_patches.py)'
+  );
+
+  // Helper reads env at call time + returns boolean
+  assert.match(
+    src,
+    /process\.env\.WHATSAPP_READ_ONLY_INTAKE/,
+    'helper must read WHATSAPP_READ_ONLY_INTAKE env'
+  );
+
+  // Auto-receipt guard (inbound message handler)
+  assert.match(
+    src,
+    /if \(!__hermesReadOnlyIntake\(\)\)\s*\{\s*\n\s*await sendReceipt/,
+    'auto-receipt guard must wrap sendReceipt at messages-recv inbound handler'
+  );
+
+  // Retry-receipt guard (sendRetryRequest)
+  assert.match(
+    src,
+    /if \(!__hermesReadOnlyIntake\(\)\)\s*\{\s*\n\s*await sendNode\(receipt\)/,
+    'retry-receipt guard must wrap sendNode(receipt) in sendRetryRequest'
+  );
+
+  // Exactly 3 marker occurrences (1 def + 1 receipt-guard + 1 retry-guard)
+  const occurrences = (src.match(/__hermesReadOnlyIntake/g) || []).length;
+  assert.equal(
+    occurrences,
+    3,
+    `expected exactly 3 __hermesReadOnlyIntake occurrences, found ${occurrences}`
+  );
+});
+
+test('RO-js-22: READ_ONLY_BAILEYS_BLOCKED_METHODS comprehensively blocks audit-derived mutators', () => {
+  // Closes RED finding #2: original 18-entry list missed ~30 mutators
+  // (relayMessage, presenceSubscribe, sendRetryRequest, fetchMessageHistory,
+  // requestPlaceholderResend, rejectCall, newsletter*, product*, privacy*,
+  // contact/label/star, etc.).
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  const required = [
+    // messages-send.js
+    'sendMessage', 'sendReceipt', 'sendReceipts', 'readMessages',
+    'relayMessage', 'sendPeerDataOperationMessage', 'updateMediaMessage',
+    // messages-recv.js public
+    'sendRetryRequest', 'rejectCall',
+    'fetchMessageHistory', 'requestPlaceholderResend',
+    // chats.js
+    'sendPresenceUpdate', 'presenceSubscribe', 'chatModify',
+    'updateProfilePicture', 'updateProfileName', 'updateProfileStatus',
+    'updateBlockStatus',
+    'updateDisableLinkPreviewsPrivacy', 'updateCallPrivacy',
+    'updateMessagesPrivacy', 'updateReadReceiptsPrivacy',
+    'updateGroupsAddPrivacy', 'updateDefaultDisappearingMode',
+    'addOrEditContact', 'removeContact',
+    'addLabel', 'star',
+    // groups.js
+    'groupCreate', 'groupLeave', 'groupParticipantsUpdate',
+    'groupUpdateDescription', 'groupRevokeInvite', 'groupAcceptInvite',
+    // newsletter.js
+    'newsletterCreate', 'newsletterUpdate', 'newsletterReactMessage',
+    'newsletterMute', 'newsletterUnmute', 'newsletterFollow',
+    'newsletterUnfollow',
+    // business.js
+    'productCreate', 'productDelete', 'productUpdate',
+  ];
+  for (const m of required) {
+    assert.match(
+      src,
+      new RegExp(`'${m}'`),
+      `READ_ONLY_BAILEYS_BLOCKED_METHODS must list '${m}'`
+    );
+  }
+});
+
+test('RO-js-22b: protocol-required methods MUST NOT be in BLOCKED_METHODS', () => {
+  // Wrapping these would break protocol-level ack of received messages.
+  // WhatsApp servers disconnect clients that fail to ack received stanzas.
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+  const blockedStart = src.indexOf('const READ_ONLY_BAILEYS_BLOCKED_METHODS');
+  assert.notEqual(blockedStart, -1, 'BLOCKED_METHODS const must exist');
+  const blockedEnd = src.indexOf('];', blockedStart);
+  assert.notEqual(blockedEnd, -1, 'BLOCKED_METHODS array must terminate');
+  const arr = src.slice(blockedStart, blockedEnd);
+
+  for (const protoMethod of ['sendMessageAck', 'sendNode', 'sendRawMessage']) {
+    assert.equal(
+      arr.includes(`'${protoMethod}'`),
+      false,
+      `${protoMethod} MUST NOT be wrapped (protocol-required; WA disconnects without it)`
+    );
+  }
+});
+
+test('RO-js-23: hardenSessionPerms helper is defined and wired on init + creds.update', () => {
+  // Closes RED finding #3: session-key dir created with default umask;
+  // saveCreds() didn't chmod files. After this fix, dirs are 0o700 and
+  // files are 0o600 after every creds.update.
+  const src = readFileSync(BRIDGE_PATH, 'utf8');
+
+  assert.match(
+    src,
+    /function hardenSessionPerms\(dir\)\s*\{/,
+    'hardenSessionPerms helper must be defined'
+  );
+
+  assert.match(
+    src,
+    /chmodSync.*from\s+['"]fs['"]/,
+    'chmodSync must be imported from fs'
+  );
+
+  assert.match(
+    src,
+    /chmodSync\(dir,\s*0o700\)/,
+    'must chmod 0o700 on directory entries'
+  );
+
+  assert.match(
+    src,
+    /chmodSync\(full,\s*0o600\)/,
+    'must chmod 0o600 on file entries'
+  );
+
+  assert.match(
+    src,
+    /mkdirSync\(SESSION_DIR[\s\S]{0,3000}?hardenSessionPerms\(SESSION_DIR\);/,
+    'hardenSessionPerms(SESSION_DIR) must be called after mkdirSync init'
+  );
+
+  assert.match(
+    src,
+    /creds\.update[\s\S]{0,500}?await saveCreds\(\);[\s\S]{0,100}?hardenSessionPerms\(SESSION_DIR\);/,
+    'creds.update handler must await saveCreds() then call hardenSessionPerms(SESSION_DIR)'
+  );
+});
+
+test('RO-js-24: bridge boot logs wrapped/missing summary under READ_ONLY_INTAKE', async () => {
+  // Verifies the per-method wrap audit log fires once startSocket() reaches
+  // the wrap loop (after useMultiFileAuthState + fetchLatestBaileysVersion +
+  // makeWASocket — several seconds on fresh tmp session). Poll up to 8s.
+  const port = pickPort();
+  const sessionDir = mkdtempSync(path.join(tmpdir(), 'hermes-wa-ro-'));
+  const h = await spawnBridge({ readOnly: true, port, sessionDir });
+  try {
+    assert.ok(h.healthy, 'bridge did not become healthy');
+    const WRAP_RE = /🔒 READ_ONLY: wrapped READ_ONLY_BAILEYS_BLOCKED_METHODS = \d+\/\d+/;
+    const deadline = Date.now() + 8000;
+    let matched = false;
+    while (Date.now() < deadline) {
+      if (WRAP_RE.test(h.stdout())) { matched = true; break; }
+      await wait(200);
+    }
+    assert.ok(
+      matched,
+      `bridge boot must log wrap summary within 8s; stdout=${h.stdout().slice(0, 1000)}`
+    );
+  } finally {
+    killBridge(h);
+    rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test('RO-js-25: hardenSessionPerms chmods session dir to 0o700 + pre-existing files to 0o600 on init', async () => {
+  // Runtime verification of Phase 3 (RED finding #3): not only must
+  // hardenSessionPerms exist in source (covered by RO-js-23), it must
+  // ACTUALLY chmod on bridge boot. Set initial perms loose (0o755 dir,
+  // 0o644 file) and verify they get tightened.
+  const port = pickPort();
+  const sessionDir = mkdtempSync(path.join(tmpdir(), 'hermes-wa-ro-perms-'));
+  // mkdtempSync gives 0o700 on macOS, varies on Linux — force loose
+  chmodSync(sessionDir, 0o755);
+  const fakeFile = path.join(sessionDir, 'fake_creds.json');
+  writeFileSync(fakeFile, '{"placeholder": true}');
+  chmodSync(fakeFile, 0o644);
+
+  const h = await spawnBridge({ readOnly: true, port, sessionDir });
+  try {
+    assert.ok(h.healthy, 'bridge did not become healthy');
+    // Allow init chmod to run (synchronous after mkdirSync, but spawn
+    // process startup needs a tick)
+    await wait(500);
+
+    const dirMode = statSync(sessionDir).mode & 0o777;
+    assert.equal(
+      dirMode,
+      0o700,
+      `session dir must be 0o700 after init, got 0o${dirMode.toString(8)}`
+    );
+
+    const fileMode = statSync(fakeFile).mode & 0o777;
+    assert.equal(
+      fileMode,
+      0o600,
+      `pre-existing session file must be 0o600 after init, got 0o${fileMode.toString(8)}`
+    );
+  } finally {
+    killBridge(h);
+    rmSync(sessionDir, { recursive: true, force: true });
   }
 });
