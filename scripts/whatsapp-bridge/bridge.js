@@ -29,6 +29,8 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { SocksProxyAgent } from 'socks-proxy-agent';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -334,6 +336,25 @@ async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
+  // [Proxy support] If WHATSAPP_BRIDGE_PROXY env is set, route Baileys WSS
+  // and HTTPS fetches through it. Used for kz-1 where Cloudflare WARP
+  // localhost (e.g. socks5://127.0.0.1:40000) bypasses KZ WhatsApp DPI block.
+  // Supports socks5:// and http:// URLs. Default unset = direct outbound.
+  let bridgeProxyAgent = undefined;
+  const __bridgeProxyUrl = process.env.WHATSAPP_BRIDGE_PROXY || '';
+  if (__bridgeProxyUrl) {
+    if (__bridgeProxyUrl.startsWith('socks')) {
+      bridgeProxyAgent = new SocksProxyAgent(__bridgeProxyUrl);
+    } else if (__bridgeProxyUrl.startsWith('http')) {
+      bridgeProxyAgent = new HttpsProxyAgent(__bridgeProxyUrl);
+    } else {
+      console.warn(`[bridge] Invalid WHATSAPP_BRIDGE_PROXY scheme: '${__bridgeProxyUrl}'. Expected socks5:// or http(s)://. Ignoring.`);
+    }
+    if (bridgeProxyAgent) {
+      console.log(`🌐 [bridge] Outbound WS + HTTPS routed through proxy: ${__bridgeProxyUrl}`);
+    }
+  }
+
   sock = makeWASocket({
     version,
     auth: state,
@@ -342,6 +363,8 @@ async function startSocket() {
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    agent: bridgeProxyAgent,
+    fetchAgent: bridgeProxyAgent,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {
