@@ -5,24 +5,21 @@ Hermes READ_ONLY_INTAKE patches for @whiskeysockets/baileys.
 Pinned upstream: WhiskeySockets/Baileys#01047debd81beb20da7b7779b08edcb06aa03770
                  (= 7.0.0-rc.9 RC).
 
-Idempotent. Refuses to double-apply via __hermesReadOnlyIntake marker.
+Idempotent per-patch. Refuses to double-apply via new-text presence.
 Atomic: each anchor is asserted before mutation. Aborts cleanly on miss
 without writing the file.
 
-Closes:
-  P0-1 (post-construction sock.X = wrap CANNOT block messages-recv.js
-        closures that captured sendReceipt, sendNode at construction time).
-
-Patched sites in node_modules/@whiskeysockets/baileys/lib/Socket/messages-recv.js:
-  A. Helper function __hermesReadOnlyIntake() inserted in makeMessagesRecvSocket
-     scope (after sock construction). Truthy reads from
-     WHATSAPP_READ_ONLY_INTAKE env at call time.
-  B. Auto-receipt block: wraps the 2 sendReceipt() calls on inbound
-     messages (delivery receipt + history-sync receipt). User-visible
-     "delivered" double-tick suppressed.
-  C. Retry-request: wraps sendNode(receipt) inside sendRetryRequest
-     (server-redelivery request — outbound stanza, suppressed under
-     read-only).
+Patched sites:
+  messages-recv.js:
+    A. Helper function __hermesReadOnlyIntake() inserted in makeMessagesRecvSocket.
+    B. Auto-receipt block: wraps sendReceipt() calls on inbound messages.
+    C. Retry-request: wraps sendNode(receipt) inside sendRetryRequest.
+    D. Retry-relay: wraps relayMessage() inside retry request handler.
+  chats.js:
+    E. Helper function __hermesReadOnlyIntake() inserted in makeChatsSocket.
+    F. sendPresenceUpdate guard: early return under read-only.
+    G. Presence auto-fire on connection.open wrapped under read-only.
+    H. updateProfileName (pushNameSetting) guard under read-only.
 
 Run as npm postinstall:
     "postinstall": "python3 scripts/apply_hermes_patches.py"
@@ -35,33 +32,29 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Resolve relative to this script's location:
-#   scripts/whatsapp-bridge/scripts/apply_hermes_patches.py
-# Target lives at:
-#   scripts/whatsapp-bridge/node_modules/@whiskeysockets/baileys/lib/Socket/messages-recv.js
 HERE = Path(__file__).resolve().parent
 BRIDGE_DIR = HERE.parent
-TARGET = BRIDGE_DIR / 'node_modules' / '@whiskeysockets' / 'baileys' / 'lib' / 'Socket' / 'messages-recv.js'
 
-HELPER = """
-function __hermesReadOnlyIntake() {
-    const v = String(process.env.WHATSAPP_READ_ONLY_INTAKE || '').toLowerCase();
-    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
-}
-"""
+HELPER = """\nfunction __hermesReadOnlyIntake() {\n    const v = String(process.env.WHATSAPP_READ_ONLY_INTAKE || '').toLowerCase();\n    return v === '1' || v === 'true' || v === 'yes' || v === 'on';\n}\n"""
 
-ANCHOR_HELPER = "    const sock = makeMessagesSocket(config);"
-
-ANCHOR_RECEIPT_OLD = """                        acked = true;
+PATCHES = [
+    # ------------------------------------------------------------------ messages-recv.js
+    {
+        'file': 'messages-recv.js',
+        'old': '    const sock = makeMessagesSocket(config);',
+        'new': '    const sock = makeMessagesSocket(config);' + HELPER,
+    },
+    {
+        'file': 'messages-recv.js',
+        'old': """                        acked = true;
                         await sendReceipt(msg.key.remoteJid, participant, [msg.key.id], type);
                         // send ack for history message
                         const isAnyHistoryMsg = getHistoryMsg(msg.message);
                         if (isAnyHistoryMsg) {
                             const jid = jidNormalizedUser(msg.key.remoteJid);
                             await sendReceipt(jid, undefined, [msg.key.id], 'hist_sync'); // TODO: investigate
-                        }"""
-
-ANCHOR_RECEIPT_NEW = """                        acked = true;
+                        }""",
+        'new': """                        acked = true;
                         if (!__hermesReadOnlyIntake()) {
                             await sendReceipt(msg.key.remoteJid, participant, [msg.key.id], type);
                             // send ack for history message
@@ -70,59 +63,106 @@ ANCHOR_RECEIPT_NEW = """                        acked = true;
                                 const jid = jidNormalizedUser(msg.key.remoteJid);
                                 await sendReceipt(jid, undefined, [msg.key.id], 'hist_sync'); // TODO: investigate
                             }
-                        }"""
-
-ANCHOR_RETRY_OLD = """            await sendNode(receipt);
-            logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt');"""
-
-ANCHOR_RETRY_NEW = """            if (!__hermesReadOnlyIntake()) {
+                        }""",
+    },
+    {
+        'file': 'messages-recv.js',
+        'old': """            await sendNode(receipt);
+            logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt');""",
+        'new': """            if (!__hermesReadOnlyIntake()) {
                 await sendNode(receipt);
                 logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt');
-            }"""
+            }""",
+    },
+    {
+        'file': 'messages-recv.js',
+        'old': '                await relayMessage(key.remoteJid, msg, msgRelayOpts);',
+        'new': """                if (!__hermesReadOnlyIntake()) {
+                    await relayMessage(key.remoteJid, msg, msgRelayOpts);
+                }""",
+    },
+    # ------------------------------------------------------------------ chats.js
+    {
+        'file': 'chats.js',
+        'old': '    const sock = makeSocket(config);',
+        'new': '    const sock = makeSocket(config);' + HELPER,
+    },
+    {
+        'file': 'chats.js',
+        'old': """    const sendPresenceUpdate = async (type, toJid) => {
+        const me = authState.creds.me;""",
+        'new': """    const sendPresenceUpdate = async (type, toJid) => {
+        if (__hermesReadOnlyIntake()) return;
+        const me = authState.creds.me;""",
+    },
+    {
+        'file': 'chats.js',
+        'old': '            sendPresenceUpdate(markOnlineOnConnect ? \'available\' : \'unavailable\').catch(error => onUnexpectedError(error, \'presence update requests\'));',
+        'new': """            if (!__hermesReadOnlyIntake()) {
+                sendPresenceUpdate(markOnlineOnConnect ? 'available' : 'unavailable').catch(error => onUnexpectedError(error, 'presence update requests'));
+            }""",
+    },
+    {
+        'file': 'chats.js',
+        'old': """    const updateProfileName = async (name) => {
+        await chatModify({ pushNameSetting: name }, '');
+    };""",
+        'new': """    const updateProfileName = async (name) => {
+        if (__hermesReadOnlyIntake()) return;
+        await chatModify({ pushNameSetting: name }, '');
+    };""",
+    },
+]
+
+
+def run(base_dir: Path) -> int:
+    baileys = base_dir / 'node_modules' / '@whiskeysockets' / 'baileys' / 'lib' / 'Socket'
+    all_targets = {p['file'] for p in PATCHES}
+    written_any = False
+
+    for target_name in sorted(all_targets):
+        target = baileys / target_name
+        if not target.exists():
+            print(f'SKIP_NO_TARGET: {target}', file=sys.stderr)
+            continue
+
+        content = target.read_text(encoding='utf-8')
+        patches_for_file = [p for p in PATCHES if p['file'] == target_name]
+        modified = False
+
+        for patch in patches_for_file:
+            old = patch['old']
+            new = patch['new']
+
+            if new in content:
+                # Already applied (idempotent)
+                continue
+
+            if old not in content:
+                print(f'ERR: anchor drift in {target_name}', file=sys.stderr)
+                print('Baileys upstream may have changed. Re-pin or refresh anchors.', file=sys.stderr)
+                return 2
+
+            content = content.replace(old, new, 1)
+            modified = True
+
+        if modified:
+            target.write_text(content, encoding='utf-8')
+            written_any = True
+            print(f'OK_PATCHED: {target_name}')
+
+    if not written_any:
+        print('SKIP_ALREADY_PATCHED')
+
+    return 0
 
 
 def main() -> int:
-    if not TARGET.exists():
-        # Not an error: node_modules may not exist yet (pre-npm-install).
-        # postinstall fires AFTER deps install so this should be reached
-        # with node_modules present. If missing, log and exit OK so we
-        # don't break local dev workflows that don't install bridge deps.
-        print(f'SKIP_NO_TARGET: {TARGET}', file=sys.stderr)
-        return 0
-
-    content = TARGET.read_text(encoding='utf-8')
-
-    if '__hermesReadOnlyIntake' in content:
-        print('SKIP_ALREADY_PATCHED')
-        return 0
-
-    # Pre-flight: verify ALL anchors before mutating
-    missing = []
-    if ANCHOR_HELPER not in content:
-        missing.append('helper_anchor')
-    if ANCHOR_RECEIPT_OLD not in content:
-        missing.append('receipt_anchor')
-    if ANCHOR_RETRY_OLD not in content:
-        missing.append('retry_anchor')
-    if missing:
-        print(f'ERR: missing anchors: {missing}', file=sys.stderr)
-        print('Baileys upstream may have changed. Re-pin or refresh anchors.', file=sys.stderr)
-        return 2
-
-    # Apply (replace count=1 for each)
-    content = content.replace(ANCHOR_HELPER, ANCHOR_HELPER + HELPER, 1)
-    content = content.replace(ANCHOR_RECEIPT_OLD, ANCHOR_RECEIPT_NEW, 1)
-    content = content.replace(ANCHOR_RETRY_OLD, ANCHOR_RETRY_NEW, 1)
-
-    # Post-flight: verify exactly 3 occurrences
-    occurrence_count = content.count('__hermesReadOnlyIntake')
-    if occurrence_count != 3:
-        print(f'ERR: post-apply count={occurrence_count}, expected exactly 3', file=sys.stderr)
-        return 3
-
-    TARGET.write_text(content, encoding='utf-8')
-    print('OK_PATCHED')
-    return 0
+    if len(sys.argv) > 1:
+        base_dir = Path(sys.argv[1]).resolve()
+    else:
+        base_dir = BRIDGE_DIR
+    return run(base_dir)
 
 
 if __name__ == '__main__':

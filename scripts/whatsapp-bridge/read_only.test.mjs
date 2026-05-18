@@ -323,12 +323,19 @@ test('RO-js-21: Baileys messages-recv.js carries __hermesReadOnlyIntake source p
     'retry-receipt guard must wrap sendNode(receipt) in sendRetryRequest'
   );
 
-  // Exactly 3 marker occurrences (1 def + 1 receipt-guard + 1 retry-guard)
+  // Retry-relay guard (recv retry request handler)
+  assert.match(
+    src,
+    /if \(!__hermesReadOnlyIntake\(\)\)\s*\{\s*\n\s*await relayMessage\(key\.remoteJid, msg, msgRelayOpts\)/,
+    'retry-relay guard must wrap relayMessage in retry request handler'
+  );
+
+  // Exactly 4 marker occurrences (1 def + 1 receipt-guard + 1 retry-guard + 1 relay-guard)
   const occurrences = (src.match(/__hermesReadOnlyIntake/g) || []).length;
   assert.equal(
     occurrences,
-    3,
-    `expected exactly 3 __hermesReadOnlyIntake occurrences, found ${occurrences}`
+    4,
+    `expected exactly 4 __hermesReadOnlyIntake occurrences, found ${occurrences}`
   );
 });
 
@@ -498,4 +505,104 @@ test('RO-js-25: hardenSessionPerms chmods session dir to 0o700 + pre-existing fi
     killBridge(h);
     rmSync(sessionDir, { recursive: true, force: true });
   }
+});
+
+test('RO-js-26: Baileys chats.js carries __hermesReadOnlyIntake source patches', () => {
+  const baileysPath = path.resolve(
+    'node_modules/@whiskeysockets/baileys/lib/Socket/chats.js'
+  );
+  const src = readFileSync(baileysPath, 'utf8');
+
+  assert.match(
+    src,
+    /function __hermesReadOnlyIntake\(\)\s*\{/,
+    'chats.js must carry the __hermesReadOnlyIntake helper'
+  );
+
+  // sendPresenceUpdate early-return guard
+  assert.match(
+    src,
+    /const sendPresenceUpdate = async \(type, toJid\) => \{\n\s*if \(__hermesReadOnlyIntake\(\)\) return;/,
+    'sendPresenceUpdate must have early-return guard under read-only'
+  );
+
+  // Presence auto-fire on connection.open wrapped
+  assert.match(
+    src,
+    /if \(!__hermesReadOnlyIntake\(\)\)\s*\{\s*\n\s*sendPresenceUpdate\(markOnlineOnConnect \? 'available' : 'unavailable'\)/,
+    'presence auto-fire on connection.open must be wrapped under read-only'
+  );
+
+  // updateProfileName (pushNameSetting) guard
+  assert.match(
+    src,
+    /const updateProfileName = async \(name\) => \{\n\s*if \(__hermesReadOnlyIntake\(\)\) return;\n\s*await chatModify\(\{ pushNameSetting: name \}, ''\);/,
+    'updateProfileName must have early-return guard under read-only'
+  );
+
+  const occurrences = (src.match(/__hermesReadOnlyIntake/g) || []).length;
+  assert.equal(
+    occurrences,
+    4,
+    `expected exactly 4 __hermesReadOnlyIntake occurrences in chats.js, found ${occurrences}`
+  );
+});
+
+test('RO-js-27: patcher fails loud on anchor drift', async () => {
+  // Fixture-based drift test: copy clean target, mangle anchor, run patcher,
+  // assert non-zero exit and clear error.
+  const { execSync } = await import('child_process');
+  const { mkdtempSync, writeFileSync, copyFileSync, readFileSync } = await import('fs');
+  const { tmpdir } = await import('os');
+  const { join } = await import('path');
+
+  const cleanSrc = path.resolve(
+    'node_modules/@whiskeysockets/baileys/lib/Socket/messages-recv.js'
+  );
+  const tempDir = mkdtempSync(join(tmpdir(), 'hermes-wa-drift-'));
+  const fakeBase = join(tempDir, 'bridge');
+  const fakeSocket = join(fakeBase, 'node_modules', '@whiskeysockets', 'baileys', 'lib', 'Socket');
+  const tempFile = join(tempDir, 'messages-recv.js');
+  copyFileSync(cleanSrc, tempFile);
+
+  // Unapply the helper patch so we have a clean anchor to mangle
+  let content = readFileSync(tempFile, 'utf8');
+  const helperBlock = 'function __hermesReadOnlyIntake() {\n' +
+    '    const v = String(process.env.WHATSAPP_READ_ONLY_INTAKE || \'\').toLowerCase();\n' +
+    '    return v === \'1\' || v === \'true\' || v === \'yes\' || v === \'on\';\n' +
+    '}\n';
+  content = content.replace(helperBlock, '');
+  // Mangle the anchor
+  content = content.replace(
+    '    const sock = makeMessagesSocket(config);',
+    '    const sock = makeMessagesSocket(configX);'
+  );
+  writeFileSync(tempFile, content);
+
+  // Create fake dir structure and copy other files
+  const fs = await import('fs');
+  fs.mkdirSync(fakeSocket, { recursive: true });
+  fs.copyFileSync(tempFile, join(fakeSocket, 'messages-recv.js'));
+  fs.copyFileSync(
+    path.resolve('node_modules/@whiskeysockets/baileys/lib/Socket/chats.js'),
+    join(fakeSocket, 'chats.js')
+  );
+
+  let exitCode = 0;
+  let stderr = '';
+  try {
+    execSync(`python3 ${path.resolve('scripts/apply_hermes_patches.py')} "${fakeBase}"`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    exitCode = e.status || 1;
+    stderr = e.stderr || '';
+  }
+
+  assert.notEqual(exitCode, 0, 'patcher must exit non-zero on anchor drift');
+  assert.ok(
+    stderr.includes('anchor drift') || stderr.includes('anchor drift'),
+    `stderr must mention anchor drift; got: ${stderr.slice(0, 200)}`
+  );
 });
